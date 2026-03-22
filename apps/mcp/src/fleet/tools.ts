@@ -1,11 +1,12 @@
 // =============================================================
 // Fleet Memory Prototype — MCP Tool Definitions
-// Registers the 5 fleet memory tools on an McpServer instance.
+// Registers the 6 fleet memory tools on an McpServer instance.
 // =============================================================
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { z } from "zod"
 import type { GatewayContext } from "./types"
+import type { MemoryStore } from "./store"
 import {
 	storeEpisode,
 	storeFact,
@@ -37,12 +38,14 @@ function errorResponse(err: unknown) {
 
 /**
  * Register all Fleet Memory tools on the given McpServer.
- * @param server  - The McpServer instance (from @modelcontextprotocol/sdk)
- * @param getCtx  - Callback that returns the current GatewayContext for the request
+ * @param server  - The McpServer instance
+ * @param getCtx  - Returns the current GatewayContext for the request
+ * @param store   - The MemoryStore backend (DurableObjectStore in production)
  */
 export function registerFleetMemoryTools(
 	server: McpServer,
 	getCtx: () => GatewayContext,
+	store: MemoryStore,
 ): void {
 	// ── memory_recall ─────────────────────────────────────────────────────────
 
@@ -66,7 +69,7 @@ export function registerFleetMemoryTools(
 					.string()
 					.optional()
 					.describe(
-						"ISO 8601 duration, e.g. P7D for last 7 days. Applies only to episodic.",
+						"ISO 8601 duration, e.g. P7D for last 7 days. Applies to episodic only.",
 					),
 				max_results: z
 					.number()
@@ -95,7 +98,7 @@ export function registerFleetMemoryTools(
 					if (match) time_window_days = Number.parseInt(match[1], 10)
 				}
 
-				const response = recall(ctx, {
+				const response = await recall(ctx, store, {
 					query: args.query,
 					memory_types: args.memory_types,
 					time_window_days,
@@ -170,7 +173,7 @@ export function registerFleetMemoryTools(
 		}) => {
 			try {
 				const ctx = getCtx()
-				const episode = storeEpisode(ctx, {
+				const episode = await storeEpisode(ctx, store, {
 					session_id: args.session_id ?? ctx.session_id ?? crypto.randomUUID(),
 					actor_id: ctx.principal_id,
 					actor_role: "agent",
@@ -184,7 +187,7 @@ export function registerFleetMemoryTools(
 						content: [
 							{
 								type: "text" as const,
-								text: `Episode stored but flagged for review (risk_score=${episode.risk_score.toFixed(2)}). It will not be served to other agents until reviewed.`,
+								text: "Episode stored but flagged for review. It will not be served to other agents until reviewed.",
 							},
 						],
 					}
@@ -239,17 +242,24 @@ export function registerFleetMemoryTools(
 					.max(1)
 					.optional()
 					.default(0.9)
-					.describe("Confidence level for this fact"),
+					.describe("Confidence level for this fact (0–1)"),
 				scope: z
 					.enum(["user", "org"])
 					.optional()
 					.default("user")
-					.describe("Visibility scope: user (private) or org (all agents in tenant)"),
+					.describe(
+						"Visibility scope: user (private to this user) or org (visible to all agents in tenant)",
+					),
 			}),
 		},
 		// @ts-expect-error - zod inference vs MCP SDK types
 		async (args: {
-			category: "preference" | "identity" | "relationship" | "decision" | "context"
+			category:
+				| "preference"
+				| "identity"
+				| "relationship"
+				| "decision"
+				| "context"
 			key: string
 			value: string
 			confidence?: number
@@ -257,7 +267,7 @@ export function registerFleetMemoryTools(
 		}) => {
 			try {
 				const ctx = getCtx()
-				const fact = storeFact(ctx, {
+				const fact = await storeFact(ctx, store, {
 					subject_id: ctx.principal_id,
 					scope: args.scope ?? "user",
 					category: args.category,
@@ -285,7 +295,7 @@ export function registerFleetMemoryTools(
 		"memory_correct",
 		{
 			description:
-				"Correct or supersede an existing fact. Creates a new fact with the corrected value and marks the old one as superseded. The correction chain is preserved for audit purposes.",
+				"Correct or supersede an existing fact. Creates a new fact with the corrected value and marks the old one as superseded. The full correction chain is preserved for audit.",
 			inputSchema: z.object({
 				fact_id: z.string().uuid().describe("UUID of the fact to correct"),
 				corrected_value: z
@@ -308,7 +318,7 @@ export function registerFleetMemoryTools(
 		}) => {
 			try {
 				const ctx = getCtx()
-				const corrected = correctFact(ctx, {
+				const corrected = await correctFact(ctx, store, {
 					fact_id: args.fact_id,
 					corrected_value: args.corrected_value,
 					reason: args.reason,
@@ -333,7 +343,7 @@ export function registerFleetMemoryTools(
 		"memory_forget",
 		{
 			description:
-				"Request deletion of a specific memory or all memories for a user (GDPR/CCPA erasure). Erasure is complete and cascading for all_user_data.",
+				"Delete a specific memory or erase all your memories (GDPR/CCPA right-to-erasure). Erasure is complete and cascading for all_user_data.",
 			inputSchema: z.object({
 				target_type: z
 					.enum([
@@ -349,7 +359,7 @@ export function registerFleetMemoryTools(
 					.uuid()
 					.optional()
 					.describe(
-						"UUID of the specific record to delete (not required for all_user_data)",
+						"UUID of the specific record to delete (omit for all_user_data)",
 					),
 				reason: z
 					.string()
@@ -360,13 +370,18 @@ export function registerFleetMemoryTools(
 		},
 		// @ts-expect-error - zod inference vs MCP SDK types
 		async (args: {
-			target_type: "episode" | "fact" | "procedure" | "session" | "all_user_data"
+			target_type:
+				| "episode"
+				| "fact"
+				| "procedure"
+				| "session"
+				| "all_user_data"
 			target_id?: string
 			reason: string
 		}) => {
 			try {
 				const ctx = getCtx()
-				const deleted = forget(ctx, {
+				const deleted = await forget(ctx, store, {
 					target_type: args.target_type,
 					target_id: args.target_id,
 					reason: args.reason,
@@ -409,7 +424,7 @@ export function registerFleetMemoryTools(
 		async (args: { session_topic?: string }) => {
 			try {
 				const ctx = getCtx()
-				const warmStart = agentWarmStart(ctx, args.session_topic)
+				const warmStart = await agentWarmStart(ctx, store, args.session_topic)
 				const formatted = formatWarmStartForPrompt(warmStart)
 
 				if (!formatted) {
@@ -424,12 +439,7 @@ export function registerFleetMemoryTools(
 				}
 
 				return {
-					content: [
-						{
-							type: "text" as const,
-							text: formatted,
-						},
-					],
+					content: [{ type: "text" as const, text: formatted }],
 				}
 			} catch (err) {
 				return errorResponse(err)

@@ -6,6 +6,8 @@ export type MemoryType = "episodic" | "semantic" | "procedural"
 
 export type PrincipalKind = "user" | "agent" | "service"
 
+export type PrincipalRole = "user" | "admin" | "agent"
+
 export type ActorRole = "user" | "agent" | "tool" | "system"
 
 export type ContentType = "text" | "tool_call" | "tool_result" | "event"
@@ -151,10 +153,15 @@ export interface ProcedureStep {
 // ── Gateway / Request Context ─────────────────────────────────
 
 export interface GatewayContext {
+	/** Organization/workspace. Two agents sharing a user must share this value. */
 	tenant_id: string
+	/** The human user making the request. */
 	principal_id: string
+	/** The agent instance (MCP session DO id, prefixed "agent:"). */
 	agent_id: string
 	session_id?: string
+	/** Authorization level. Controls correctFact, forget(all_user_data) etc. */
+	role: PrincipalRole
 }
 
 // ── Sanitization ──────────────────────────────────────────────

@@ -11,6 +11,7 @@ import { z } from "zod"
 import mcpAppHtml from "../dist/mcp-app.html"
 import { registerFleetMemoryTools } from "./fleet/tools"
 import type { GatewayContext } from "./fleet/types"
+import { DurableObjectStore } from "./fleet/store"
 
 type Env = {
 	MCP_SERVER: DurableObjectNamespace
@@ -529,10 +530,11 @@ export class SupermemoryMCP extends McpAgent<Env, unknown, Props> {
 
 		// ── Fleet Memory Tools ─────────────────────────────────────────────────
 		// Multi-agent, multi-tenant persistent memory (Fleet Memory Prototype).
-		// These tools implement the three-tier memory taxonomy (episodic /
-		// semantic / procedural) with tenant isolation, sanitization, and
-		// a full audit trail.
-		registerFleetMemoryTools(this.server, () => this.getFleetContext())
+		// DurableObjectStore gives real persistence via CF DO storage so memory
+		// survives across requests. The DO instance is bound to userId, ensuring
+		// all MCP sessions for the same user share the same store.
+		const fleetStore = new DurableObjectStore(this.ctx.storage)
+		registerFleetMemoryTools(this.server, () => this.getFleetContext(), fleetStore)
 	}
 
 	/**
@@ -805,18 +807,28 @@ export class SupermemoryMCP extends McpAgent<Env, unknown, Props> {
 
 	/**
 	 * Build a GatewayContext from the current authenticated props.
-	 * In the fleet memory model, the userId maps to both the tenant and principal.
-	 * A production deployment would use a dedicated tenant registry.
+	 *
+	 * Tenant vs. principal separation:
+	 * - `tenant_id`    — the organizational workspace. Currently uses userId so
+	 *                    each user is their own personal tenant. When org support
+	 *                    is surfaced through auth.ts (organizationId), pass that
+	 *                    here instead so multiple users can share a fleet tenant.
+	 * - `principal_id` — the human user identity within the tenant.
+	 * - `agent_id`     — the MCP session (DO instance name), prefixed "agent:"
+	 *                    to distinguish it from principal IDs in the audit log.
+	 *                    A production deployment should register agent IDs in
+	 *                    the principals table with kind="agent".
 	 */
 	private getFleetContext(): GatewayContext {
 		if (!this.props) {
 			throw new Error("Authentication required")
 		}
 		return {
-			tenant_id: this.props.userId,
+			tenant_id: this.props.userId, // TODO: replace with organizationId when auth surfaces it
 			principal_id: this.props.userId,
-			agent_id: this.getMcpSessionId(),
+			agent_id: `agent:${this.getMcpSessionId()}`,
 			session_id: this.getMcpSessionId(),
+			role: "user",
 		}
 	}
 }

@@ -2,6 +2,10 @@
 // Fleet Memory Prototype — Memory Gateway
 // Single entry point for all agent memory operations.
 // Pipeline: Auth → Tenant Resolution → Policy Check → Sanitize → Execute → Audit → Response
+//
+// All functions are async and accept an injected MemoryStore so the
+// storage backend can be swapped (InMemoryStore → DurableObjectStore →
+// SupabaseStore) without touching this module.
 // =============================================================
 
 import type {
@@ -18,62 +22,12 @@ import type {
 	AuditAction,
 	WarmStartResult,
 } from "./types"
+import type { MemoryStore } from "./store"
 import {
 	sanitizeMemoryContent,
 	formatMemoriesForAgent,
 	redactSecrets,
 } from "./sanitization"
-
-// ── In-memory store (replace with Supabase/Postgres in production) ────────────
-// This stub is intentionally simple. The real implementation connects to Postgres
-// with the 'memory_agent' role and RLS policies enforcing tenant isolation.
-const episodeStore = new Map<string, Episode>()
-const factStore = new Map<string, Fact>()
-const procedureStore = new Map<string, Procedure>()
-const auditLog: Array<{
-	id: number
-	tenant_id: string
-	principal_id: string
-	action: AuditAction
-	target_table: string
-	target_id: string | null
-	detail: Record<string, unknown>
-	created_at: string
-}> = []
-let auditSeq = 0
-
-// ── Audit helper ──────────────────────────────────────────────────────────────
-
-function audit(
-	ctx: GatewayContext,
-	action: AuditAction,
-	target_table: string,
-	target_id: string | null,
-	detail: Record<string, unknown> = {},
-): void {
-	auditLog.push({
-		id: ++auditSeq,
-		tenant_id: ctx.tenant_id,
-		principal_id: ctx.principal_id,
-		action,
-		target_table,
-		target_id,
-		detail,
-		created_at: new Date().toISOString(),
-	})
-}
-
-// ── Tenant isolation helper ───────────────────────────────────────────────────
-
-function assertTenant<T extends { tenant_id: string }>(
-	item: T | undefined,
-	ctx: GatewayContext,
-): T {
-	if (!item) throw new GatewayError("NOT_FOUND", "Memory not found")
-	if (item.tenant_id !== ctx.tenant_id)
-		throw new GatewayError("FORBIDDEN", "Cross-tenant access denied")
-	return item
-}
 
 // ── Error class ───────────────────────────────────────────────────────────────
 
@@ -92,6 +46,38 @@ export class GatewayError extends Error {
 	}
 }
 
+// ── Audit helper (async, append-only) ────────────────────────────────────────
+
+async function audit(
+	ctx: GatewayContext,
+	store: MemoryStore,
+	action: AuditAction,
+	target_table: string,
+	target_id: string | null,
+	detail: Record<string, unknown> = {},
+): Promise<void> {
+	await store.appendAudit({
+		tenant_id: ctx.tenant_id,
+		principal_id: ctx.principal_id,
+		action,
+		target_table,
+		target_id,
+		detail,
+		created_at: new Date().toISOString(),
+	})
+}
+
+// ── Tenant isolation helper ───────────────────────────────────────────────────
+
+function assertTenant<T extends { tenant_id: string }>(
+	item: T | undefined,
+	ctx: GatewayContext,
+): asserts item is T {
+	if (!item) throw new GatewayError("NOT_FOUND", "Memory not found")
+	if (item.tenant_id !== ctx.tenant_id)
+		throw new GatewayError("FORBIDDEN", "Cross-tenant access denied")
+}
+
 // ── Store Episode ─────────────────────────────────────────────────────────────
 
 export interface StoreEpisodeInput {
@@ -104,18 +90,19 @@ export interface StoreEpisodeInput {
 	expires_in_days?: number
 }
 
-export function storeEpisode(
+export async function storeEpisode(
 	ctx: GatewayContext,
+	store: MemoryStore,
 	input: StoreEpisodeInput,
-): Episode {
-	// 1. Sanitize
-	const redacted = redactSecrets(input.content)
+): Promise<Episode> {
+	// 1. Detect injection BEFORE redaction so patterns aren't hidden by redaction
 	const sanitized: SanitizationResult = sanitizeMemoryContent(
-		redacted,
+		input.content,
 		input.content_type ?? "text",
 	)
+	// 2. Redact secrets from the content that will be stored
+	const safeContent = redactSecrets(sanitized.content)
 
-	const now = new Date().toISOString()
 	const id = crypto.randomUUID()
 	const episode: Episode = {
 		id,
@@ -123,10 +110,10 @@ export function storeEpisode(
 		session_id: input.session_id,
 		actor_id: input.actor_id,
 		actor_role: input.actor_role,
-		content: sanitized.content,
+		content: safeContent,
 		content_type: input.content_type ?? "text",
 		importance: input.importance ?? 0.5,
-		created_at: now,
+		created_at: new Date().toISOString(),
 		expires_at: input.expires_in_days
 			? new Date(
 					Date.now() + input.expires_in_days * 86_400_000,
@@ -134,18 +121,18 @@ export function storeEpisode(
 			: undefined,
 		compacted: false,
 		quarantined: sanitized.action === "quarantine",
-		risk_score: sanitized.risk_score,
-		risk_flags: sanitized.flags,
+		// Don't store the exact risk_score/flags to avoid leaking detection thresholds
+		risk_score: sanitized.risk_score >= 0.5 ? 1 : 0,
+		risk_flags: sanitized.action === "quarantine" ? ["flagged"] : [],
 		provenance: { source_agent: ctx.agent_id },
 	}
 
-	episodeStore.set(id, episode)
+	await store.setEpisode(episode)
 
-	// 2. Audit
+	// Audit: record quarantine or normal write, but never the risk_score detail
 	const auditAction: AuditAction =
 		sanitized.action === "quarantine" ? "quarantine" : "write"
-	audit(ctx, auditAction, "episodes", id, {
-		risk_score: sanitized.risk_score,
+	await audit(ctx, store, auditAction, "episodes", id, {
 		quarantined: episode.quarantined,
 	})
 
@@ -164,23 +151,25 @@ export interface StoreFactInput {
 	source_episodes?: string[]
 }
 
-export function storeFact(ctx: GatewayContext, input: StoreFactInput): Fact {
-	// 1. Sanitize value
-	const redacted = redactSecrets(input.value)
-	const sanitized = sanitizeMemoryContent(redacted, "text")
+export async function storeFact(
+	ctx: GatewayContext,
+	store: MemoryStore,
+	input: StoreFactInput,
+): Promise<Fact> {
+	// 1. Detect injection BEFORE redaction
+	const sanitized = sanitizeMemoryContent(input.value, "text")
 	if (sanitized.action === "quarantine") {
-		audit(ctx, "quarantine", "facts", null, {
-			key: input.key,
-			risk_score: sanitized.risk_score,
-		})
+		await audit(ctx, store, "quarantine", "facts", null, { key: input.key })
 		throw new GatewayError(
 			"QUARANTINED",
 			"Fact content flagged for review and has not been stored",
 		)
 	}
+	const safeValue = redactSecrets(sanitized.content)
 
-	// 2. Check for existing active fact (same key)
-	const existingEntry = [...factStore.values()].find(
+	// 2. Check for existing active fact (same key in same scope+category)
+	const allFacts = await store.allFacts()
+	const existingEntry = allFacts.find(
 		(f) =>
 			f.tenant_id === ctx.tenant_id &&
 			f.subject_id === input.subject_id &&
@@ -200,7 +189,7 @@ export function storeFact(ctx: GatewayContext, input: StoreFactInput): Fact {
 		scope: input.scope,
 		category: input.category,
 		key: input.key,
-		value: sanitized.content,
+		value: safeValue,
 		confidence: input.confidence ?? 1.0,
 		source_episodes: input.source_episodes ?? [],
 		created_at: now,
@@ -208,20 +197,24 @@ export function storeFact(ctx: GatewayContext, input: StoreFactInput): Fact {
 		created_by: ctx.agent_id,
 	}
 
-	// 3. If existing fact, check for conflicts before superseding
+	// 3. Handle conflicts before inserting
 	if (existingEntry) {
-		const delta = Math.abs(
-			existingEntry.confidence - (input.confidence ?? 1.0),
-		)
+		const newConfidence = input.confidence ?? 1.0
+		const delta = Math.abs(existingEntry.confidence - newConfidence)
 
 		if (delta > 0.3) {
-			// Auto-resolve to higher confidence: supersede old fact
+			// Auto-resolve: higher confidence wins; mark old as superseded
 			existingEntry.superseded_by = id
-			factStore.set(existingEntry.id, existingEntry)
+			await store.setFact(existingEntry)
+			// Audit the supersede — previously missing
+			await audit(ctx, store, "correct", "facts", existingEntry.id, {
+				superseded_by: id,
+				reason: "auto_resolved:confidence_delta",
+				confidence_delta: delta,
+			})
 		} else if (existingEntry.value !== input.value) {
-			// Low-confidence conflict: store both, flag for user resolution
-			// The new fact goes in, but a conflict record is created
-			audit(ctx, "write", "facts", id, {
+			// Low-confidence conflict: store both and flag for user resolution
+			await audit(ctx, store, "write", "facts", id, {
 				conflict: true,
 				existing_fact_id: existingEntry.id,
 				confidence_delta: delta,
@@ -229,8 +222,11 @@ export function storeFact(ctx: GatewayContext, input: StoreFactInput): Fact {
 		}
 	}
 
-	factStore.set(id, fact)
-	audit(ctx, "write", "facts", id, { key: input.key, scope: input.scope })
+	await store.setFact(fact)
+	await audit(ctx, store, "write", "facts", id, {
+		key: input.key,
+		scope: input.scope,
+	})
 
 	return fact
 }
@@ -243,30 +239,42 @@ export interface CorrectFactInput {
 	reason?: string
 }
 
-export function correctFact(
+export async function correctFact(
 	ctx: GatewayContext,
+	store: MemoryStore,
 	input: CorrectFactInput,
-): Fact {
-	const existing = factStore.get(input.fact_id)
+): Promise<Fact> {
+	const existing = await store.getFact(input.fact_id)
 	assertTenant(existing, ctx)
 
-	// Create corrected fact — NEVER overwrite, always supersede
+	// Authorization: only the fact's subject, the creating agent, or an admin
+	const isSubject = existing.subject_id === ctx.principal_id
+	const isCreator = existing.created_by === ctx.agent_id
+	const isAdmin = ctx.role === "admin"
+	if (!isSubject && !isCreator && !isAdmin) {
+		throw new GatewayError(
+			"FORBIDDEN",
+			"You can only correct facts about yourself or facts your agent created",
+		)
+	}
+
+	// NEVER overwrite — always create a new fact and mark the old as superseded
 	const corrected: Fact = {
 		...existing,
 		id: crypto.randomUUID(),
 		value: input.corrected_value,
-		confidence: 1.0, // explicit user correction wins
+		confidence: 1.0, // explicit correction wins unconditionally
 		updated_at: new Date().toISOString(),
 		created_at: new Date().toISOString(),
-		created_by: ctx.principal_id, // correction by the requester
+		created_by: ctx.principal_id,
+		superseded_by: undefined,
 	}
 
-	// Mark old fact as superseded
 	existing.superseded_by = corrected.id
-	factStore.set(existing.id, existing)
-	factStore.set(corrected.id, corrected)
+	await store.setFact(existing)
+	await store.setFact(corrected)
 
-	audit(ctx, "correct", "facts", corrected.id, {
+	await audit(ctx, store, "correct", "facts", corrected.id, {
 		superseded_id: existing.id,
 		reason: input.reason,
 	})
@@ -281,13 +289,15 @@ export interface RecallInput {
 	memory_types?: MemoryType[]
 	time_window_days?: number
 	max_results?: number
-	subject_id?: string
+	// subject_id intentionally removed — user-scoped facts are only visible to
+	// the principal identified in ctx. Agents cannot cross-read private facts.
 }
 
-export function recall(
+export async function recall(
 	ctx: GatewayContext,
+	store: MemoryStore,
 	input: RecallInput,
-): RecallResponse {
+): Promise<RecallResponse> {
 	const types = input.memory_types ?? ["semantic", "procedural"]
 	const maxResults = Math.min(input.max_results ?? 10, 50)
 	const cutoff = input.time_window_days
@@ -296,13 +306,13 @@ export function recall(
 
 	const results: RecalledMemory[] = []
 
-	// Episodic recall — exclude quarantined
+	// Episodic — quarantined episodes are never served to agents
 	if (types.includes("episodic")) {
-		for (const ep of episodeStore.values()) {
+		const episodes = await store.allEpisodes()
+		for (const ep of episodes) {
 			if (ep.tenant_id !== ctx.tenant_id) continue
 			if (ep.quarantined) continue
 			if (cutoff && ep.created_at < cutoff) continue
-			// Simple text match (production uses vector search)
 			if (
 				input.query.length > 0 &&
 				!ep.content.toLowerCase().includes(input.query.toLowerCase())
@@ -319,18 +329,14 @@ export function recall(
 		}
 	}
 
-	// Semantic recall — only active (non-superseded) facts visible to this principal
+	// Semantic — only active (non-superseded) facts; user-scope strictly locked to subject
 	if (types.includes("semantic")) {
-		for (const fact of factStore.values()) {
+		const facts = await store.allFacts()
+		for (const fact of facts) {
 			if (fact.tenant_id !== ctx.tenant_id) continue
-			if (fact.superseded_by) continue // skip superseded
-			// Scope check: user-scoped facts only visible to subject
-			if (
-				fact.scope === "user" &&
-				fact.subject_id !== ctx.principal_id &&
-				fact.subject_id !== (input.subject_id ?? ctx.principal_id)
-			)
-				continue
+			if (fact.superseded_by) continue
+			// User-scoped facts: only the subject can see them. Period.
+			if (fact.scope === "user" && fact.subject_id !== ctx.principal_id) continue
 			if (
 				input.query.length > 0 &&
 				!fact.value.toLowerCase().includes(input.query.toLowerCase()) &&
@@ -347,9 +353,10 @@ export function recall(
 		}
 	}
 
-	// Procedural recall
+	// Procedural
 	if (types.includes("procedural")) {
-		for (const proc of procedureStore.values()) {
+		const procedures = await store.allProcedures()
+		for (const proc of procedures) {
 			if (proc.tenant_id !== ctx.tenant_id) continue
 			if (
 				input.query.length > 0 &&
@@ -369,12 +376,11 @@ export function recall(
 		}
 	}
 
-	// Sort by confidence desc, truncate
 	const sorted = results
 		.sort((a, b) => b.confidence - a.confidence)
 		.slice(0, maxResults)
 
-	audit(ctx, "read", "mixed", null, {
+	await audit(ctx, store, "read", "mixed", null, {
 		query: input.query,
 		types,
 		results_count: sorted.length,
@@ -395,53 +401,53 @@ export type ForgetTarget =
 export interface ForgetInput {
 	target_type: ForgetTarget
 	target_id?: string
-	user_id?: string // required for all_user_data
 	reason: string
 }
 
-export function forget(ctx: GatewayContext, input: ForgetInput): number {
+export async function forget(
+	ctx: GatewayContext,
+	store: MemoryStore,
+	input: ForgetInput,
+): Promise<number> {
 	let deleted = 0
 
 	if (input.target_type === "all_user_data") {
-		const userId = input.user_id ?? ctx.principal_id
-		// Validate: only the user themselves or a tenant admin may erase all data
-		if (userId !== ctx.principal_id) {
+		// Only the principal themselves or a tenant admin can erase all data.
+		// The user_id override is removed — admins must impersonate via role, not id.
+		if (ctx.role !== "admin" && ctx.role !== "user") {
 			throw new GatewayError(
 				"FORBIDDEN",
-				"Only the user or tenant admin can request full erasure",
+				"Only the user or a tenant admin can request full erasure",
 			)
 		}
+		// Non-admins can only erase their own data
+		const targetUserId = ctx.principal_id
 
-		// Delete episodes in user's sessions
-		for (const [id, ep] of episodeStore) {
-			if (ep.tenant_id === ctx.tenant_id && ep.actor_id === userId) {
-				episodeStore.delete(id)
+		for (const ep of await store.allEpisodes()) {
+			if (ep.tenant_id === ctx.tenant_id && ep.actor_id === targetUserId) {
+				await store.deleteEpisode(ep.id)
 				deleted++
 			}
 		}
-
-		// Delete user-scoped facts
-		for (const [id, fact] of factStore) {
-			if (fact.tenant_id === ctx.tenant_id && fact.subject_id === userId) {
-				factStore.delete(id)
+		for (const fact of await store.allFacts()) {
+			if (fact.tenant_id === ctx.tenant_id && fact.subject_id === targetUserId) {
+				await store.deleteFact(fact.id)
 				deleted++
 			}
 		}
-
-		// Delete user-scope procedures created by user
-		for (const [id, proc] of procedureStore) {
+		for (const proc of await store.allProcedures()) {
 			if (
 				proc.tenant_id === ctx.tenant_id &&
-				proc.created_by === userId &&
+				proc.created_by === targetUserId &&
 				proc.scope === "user"
 			) {
-				procedureStore.delete(id)
+				await store.deleteProcedure(proc.id)
 				deleted++
 			}
 		}
 
-		audit(ctx, "erasure", "all", null, {
-			user_id: userId,
+		await audit(ctx, store, "erasure", "all", null, {
+			target_user_id: targetUserId,
 			reason: input.reason,
 			deleted_count: deleted,
 		})
@@ -451,21 +457,26 @@ export function forget(ctx: GatewayContext, input: ForgetInput): number {
 
 	// Single-target deletion
 	if (!input.target_id)
-		throw new GatewayError("VALIDATION", "target_id required")
+		throw new GatewayError("VALIDATION", "target_id required for non-erasure deletes")
 
-	const storeMap = {
-		episode: episodeStore,
-		fact: factStore,
-		procedure: procedureStore,
-		session: new Map(), // sessions handled separately
-	}[input.target_type] as Map<string, { tenant_id: string }>
-
-	const item = storeMap.get(input.target_id)
-	assertTenant(item, ctx)
-	storeMap.delete(input.target_id)
+	if (input.target_type === "episode") {
+		const ep = await store.getEpisode(input.target_id)
+		assertTenant(ep, ctx)
+		await store.deleteEpisode(input.target_id)
+	} else if (input.target_type === "fact") {
+		const fact = await store.getFact(input.target_id)
+		assertTenant(fact, ctx)
+		await store.deleteFact(input.target_id)
+	} else if (input.target_type === "procedure") {
+		const proc = await store.getProcedure(input.target_id)
+		assertTenant(proc, ctx)
+		await store.deleteProcedure(input.target_id)
+	} else {
+		throw new GatewayError("VALIDATION", `Unsupported target_type: ${input.target_type}`)
+	}
 	deleted++
 
-	audit(ctx, "delete", `${input.target_type}s`, input.target_id, {
+	await audit(ctx, store, "delete", `${input.target_type}s`, input.target_id, {
 		reason: input.reason,
 	})
 
@@ -474,24 +485,24 @@ export function forget(ctx: GatewayContext, input: ForgetInput): number {
 
 // ── Agent Warm-Start ──────────────────────────────────────────────────────────
 
-export function agentWarmStart(
+export async function agentWarmStart(
 	ctx: GatewayContext,
+	store: MemoryStore,
 	sessionTopic?: string,
-): WarmStartResult {
-	// Step 1: recall user profile and preferences
-	const profileResult = recall(ctx, {
-		query: "user profile and preferences",
-		memory_types: ["semantic"],
-		max_results: 20,
-	})
-
-	// Step 2: recall recent episodic/procedural context
-	const contextResult = recall(ctx, {
-		query: sessionTopic ?? "",
-		memory_types: ["episodic", "procedural"],
-		time_window_days: 30,
-		max_results: 10,
-	})
+): Promise<WarmStartResult> {
+	const [profileResult, contextResult] = await Promise.all([
+		recall(ctx, store, {
+			query: "user profile and preferences",
+			memory_types: ["semantic"],
+			max_results: 20,
+		}),
+		recall(ctx, store, {
+			query: sessionTopic ?? "",
+			memory_types: ["episodic", "procedural"],
+			time_window_days: 30,
+			max_results: 10,
+		}),
+	])
 
 	return {
 		user_profile: profileResult.memories,
@@ -511,18 +522,14 @@ export function formatWarmStartForPrompt(warmStart: WarmStartResult): string {
 
 	if (warmStart.user_profile.length > 0) {
 		sections.push(
-			"## User Profile\n" +
-				formatMemoriesForAgent(warmStart.user_profile),
+			"## User Profile\n" + formatMemoriesForAgent(warmStart.user_profile),
 		)
 	}
-
 	if (warmStart.recent_context.length > 0) {
 		sections.push(
-			"## Recent Context\n" +
-				formatMemoriesForAgent(warmStart.recent_context),
+			"## Recent Context\n" + formatMemoriesForAgent(warmStart.recent_context),
 		)
 	}
-
 	if (warmStart.relevant_procedures.length > 0) {
 		sections.push(
 			"## Relevant Procedures\n" +
