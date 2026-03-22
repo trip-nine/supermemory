@@ -155,8 +155,9 @@ export class DurableObjectStore implements MemoryStore {
 	}
 
 	async appendAudit(entry: AuditEntry) {
-		// Monotonic key ensures chronological ordering without a sequence number
-		const key = `audit:${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
+		// ISO timestamp prefix preserves chronological ordering on list().
+		// UUID suffix guarantees uniqueness even under concurrent writes.
+		const key = `audit:${new Date().toISOString()}_${crypto.randomUUID()}`
 		await this.storage.put(key, entry)
 	}
 }
