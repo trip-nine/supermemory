@@ -198,12 +198,16 @@ export async function storeFact(
 	}
 
 	// 3. Handle conflicts before inserting
+	let factAlreadyWritten = false
 	if (existingEntry) {
 		const newConfidence = input.confidence ?? 1.0
 		const delta = Math.abs(existingEntry.confidence - newConfidence)
 
 		if (delta > 0.3) {
-			// Auto-resolve: higher confidence wins; mark old as superseded
+			// Auto-resolve: higher confidence wins; write the new fact first so
+			// the old record is never hidden without a live replacement available.
+			await store.setFact(fact)
+			factAlreadyWritten = true
 			existingEntry.superseded_by = id
 			await store.setFact(existingEntry)
 			// Audit the supersede — previously missing
@@ -222,7 +226,9 @@ export async function storeFact(
 		}
 	}
 
-	await store.setFact(fact)
+	if (!factAlreadyWritten) {
+		await store.setFact(fact)
+	}
 	await audit(ctx, store, "write", "facts", id, {
 		key: input.key,
 		scope: input.scope,
@@ -271,8 +277,8 @@ export async function correctFact(
 	}
 
 	existing.superseded_by = corrected.id
-	await store.setFact(existing)
 	await store.setFact(corrected)
+	await store.setFact(existing)
 
 	await audit(ctx, store, "correct", "facts", corrected.id, {
 		superseded_id: existing.id,
