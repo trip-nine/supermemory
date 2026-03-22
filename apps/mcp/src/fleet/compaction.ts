@@ -61,10 +61,12 @@ export function detectConflicts(facts: Fact[]): FactConflict[] {
 	const conflicts: FactConflict[] = []
 	const grouped = new Map<string, Fact[]>()
 
-	// Group active facts by (tenant_id, subject_id, key)
+	// Group active facts by (tenant_id, subject_id, scope, category, key).
+	// Scope and category are part of the uniqueness constraint — a user-scoped
+	// preference and an org-scoped preference with the same key are NOT conflicts.
 	for (const fact of facts) {
 		if (fact.superseded_by) continue
-		const groupKey = `${fact.tenant_id}:${fact.subject_id}:${fact.key}`
+		const groupKey = `${fact.tenant_id}:${fact.subject_id}:${fact.scope}:${fact.category}:${fact.key}`
 		const group = grouped.get(groupKey) ?? []
 		group.push(fact)
 		grouped.set(groupKey, group)
@@ -170,6 +172,10 @@ export async function runCompaction(
 		bySession.set(ep.session_id, group)
 	}
 
+	// Track episode IDs that were successfully fully processed.
+	// Only these will be marked compacted — failed sessions are excluded.
+	const successfulEpisodeIds = new Set<string>()
+
 	// 2. Process each session batch
 	for (const [sessionId, sessionEpisodes] of bySession) {
 		try {
@@ -182,14 +188,12 @@ export async function runCompaction(
 				.map((ep) => `[${ep.actor_role}] ${ep.content}`)
 
 			// 3. Extract facts via LLM
-			const extracted = await extractFacts(
-				EXTRACTION_SYSTEM_PROMPT,
-				contents,
-			)
+			const extracted = await extractFacts(EXTRACTION_SYSTEM_PROMPT, contents)
 
 			// 4. Merge into fact store
+			let sessionHadError = false
 			for (const ef of extracted) {
-				const subjectId = sessionEpisodes[0].actor_id // default to first actor
+				const subjectId = sessionEpisodes[0].actor_id
 				try {
 					const existing = existingFacts.find(
 						(f) =>
@@ -199,7 +203,6 @@ export async function runCompaction(
 					)
 
 					if (ef.is_correction && existing) {
-						// Correction: supersede the old fact
 						await storeFact(
 							ctx,
 							{ ...ef, key: existing.key, is_correction: true },
@@ -217,19 +220,26 @@ export async function runCompaction(
 						result.facts_created++
 					}
 				} catch (err) {
+					sessionHadError = true
 					result.errors.push(
 						`Fact store error for key "${ef.key}": ${err instanceof Error ? err.message : String(err)}`,
 					)
 				}
 			}
 
-			result.episodes_processed += sessionEpisodes.length
-
 			// 5. Detect conflicts in updated facts
 			const conflicts = detectConflicts(existingFacts)
 			result.conflicts_flagged += conflicts.filter(
 				(c) => resolveConflict(c).method === "held_for_user",
 			).length
+
+			// Only mark episodes as compacted if ALL facts for this session were stored
+			if (!sessionHadError) {
+				result.episodes_processed += sessionEpisodes.length
+				for (const ep of sessionEpisodes) {
+					successfulEpisodeIds.add(ep.id)
+				}
+			}
 		} catch (err) {
 			result.errors.push(
 				`Session ${sessionId} compaction error: ${err instanceof Error ? err.message : String(err)}`,
@@ -238,20 +248,11 @@ export async function runCompaction(
 		}
 	}
 
-	// 6. Mark episodes as compacted ONLY after facts are durably written
-	// (transaction semantics: never mark compacted until fact insert commits)
-	const compactedIds = episodes
-		.filter((ep) =>
-			[...bySession.values()]
-				.flat()
-				.map((e) => e.id)
-				.includes(ep.id),
-		)
-		.map((ep) => ep.id)
-		.slice(0, result.episodes_processed)
-
-	if (compactedIds.length > 0) {
-		await markEpisodesCompacted(compactedIds)
+	// 6. Mark episodes as compacted ONLY after facts are durably written.
+	// Invariant: compacted=true is never set unless the corresponding facts
+	// are confirmed stored (transaction semantics enforced by successfulEpisodeIds).
+	if (successfulEpisodeIds.size > 0) {
+		await markEpisodesCompacted([...successfulEpisodeIds])
 	}
 
 	return result
