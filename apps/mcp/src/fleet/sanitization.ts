@@ -97,11 +97,27 @@ export function sanitizeMemoryContent(
 }
 
 /**
+ * Escape XML special characters in user-controlled memory content so that
+ * stored content can never break out of the <memory> element or inject
+ * additional XML elements into the agent context.
+ */
+function escapeXml(str: string): string {
+	return str
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;")
+		.replace(/'/g, "&#39;")
+}
+
+/**
  * Format retrieved memories for agent injection.
  *
  * Wraps each memory in explicit XML-like delimiters so the agent's
  * system prompt can parse them without confusing them with instructions.
  * This prevents role-confusion / indirect injection via recalled content.
+ * Memory content is XML-escaped to prevent stored content from breaking
+ * out of the <memory> element.
  */
 export function formatMemoriesForAgent(memories: RecalledMemory[]): string {
 	if (memories.length === 0) return ""
@@ -111,7 +127,7 @@ export function formatMemoriesForAgent(memories: RecalledMemory[]): string {
 		const created = m.created_at
 		return (
 			`<memory type="${m.memory_type}" confidence="${confidence}" created="${created}">\n` +
-			`${m.content}\n` +
+			`${escapeXml(m.content)}\n` +
 			`</memory>`
 		)
 	})

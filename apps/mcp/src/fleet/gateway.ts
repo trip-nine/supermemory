@@ -198,6 +198,7 @@ export async function storeFact(
 	}
 
 	// 3. Handle conflicts before inserting
+	let conflictAudited = false
 	if (existingEntry) {
 		const newConfidence = input.confidence ?? 1.0
 		const delta = Math.abs(existingEntry.confidence - newConfidence)
@@ -213,20 +214,26 @@ export async function storeFact(
 				confidence_delta: delta,
 			})
 		} else if (existingEntry.value !== input.value) {
-			// Low-confidence conflict: store both and flag for user resolution
+			// Low-confidence conflict: store both and flag for user resolution.
+			// Emit one combined audit entry to avoid duplicating the write audit below.
 			await audit(ctx, store, "write", "facts", id, {
+				key: input.key,
+				scope: input.scope,
 				conflict: true,
 				existing_fact_id: existingEntry.id,
 				confidence_delta: delta,
 			})
+			conflictAudited = true
 		}
 	}
 
 	await store.setFact(fact)
-	await audit(ctx, store, "write", "facts", id, {
-		key: input.key,
-		scope: input.scope,
-	})
+	if (!conflictAudited) {
+		await audit(ctx, store, "write", "facts", id, {
+			key: input.key,
+			scope: input.scope,
+		})
+	}
 
 	return fact
 }
@@ -463,18 +470,31 @@ export async function forget(
 		const ep = await store.getEpisode(input.target_id)
 		assertTenant(ep, ctx)
 		await store.deleteEpisode(input.target_id)
+		deleted++
 	} else if (input.target_type === "fact") {
 		const fact = await store.getFact(input.target_id)
 		assertTenant(fact, ctx)
 		await store.deleteFact(input.target_id)
+		deleted++
 	} else if (input.target_type === "procedure") {
 		const proc = await store.getProcedure(input.target_id)
 		assertTenant(proc, ctx)
 		await store.deleteProcedure(input.target_id)
+		deleted++
+	} else if (input.target_type === "session") {
+		// Delete all episodes belonging to this session_id.
+		// Note: DurableObjectStore stores episodes by id (not by session), so a
+		// full-scan is required here. A production implementation should maintain
+		// an index (e.g. `session:{session_id}:{episode_id}`) to avoid this scan.
+		for (const ep of await store.allEpisodes()) {
+			if (ep.tenant_id === ctx.tenant_id && ep.session_id === input.target_id) {
+				await store.deleteEpisode(ep.id)
+				deleted++
+			}
+		}
 	} else {
 		throw new GatewayError("VALIDATION", `Unsupported target_type: ${input.target_type}`)
 	}
-	deleted++
 
 	await audit(ctx, store, "delete", `${input.target_type}s`, input.target_id, {
 		reason: input.reason,
