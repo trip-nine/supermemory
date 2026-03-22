@@ -68,11 +68,10 @@ function audit(
 function assertTenant<T extends { tenant_id: string }>(
 	item: T | undefined,
 	ctx: GatewayContext,
-): T {
+): asserts item is T {
 	if (!item) throw new GatewayError("NOT_FOUND", "Memory not found")
 	if (item.tenant_id !== ctx.tenant_id)
 		throw new GatewayError("FORBIDDEN", "Cross-tenant access denied")
-	return item
 }
 
 // ── Error class ───────────────────────────────────────────────────────────────
