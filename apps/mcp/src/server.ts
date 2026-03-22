@@ -9,6 +9,8 @@ import { SupermemoryClient, getMemoryText } from "./client"
 import { initPosthog, posthog } from "./posthog"
 import { z } from "zod"
 import mcpAppHtml from "../dist/mcp-app.html"
+import { registerFleetMemoryTools } from "./fleet/tools"
+import type { GatewayContext } from "./fleet/types"
 
 type Env = {
 	MCP_SERVER: DurableObjectNamespace
@@ -524,6 +526,13 @@ export class SupermemoryMCP extends McpAgent<Env, unknown, Props> {
 				}
 			},
 		)
+
+		// ── Fleet Memory Tools ─────────────────────────────────────────────────
+		// Multi-agent, multi-tenant persistent memory (Fleet Memory Prototype).
+		// These tools implement the three-tier memory taxonomy (episodic /
+		// semantic / procedural) with tenant isolation, sanitization, and
+		// a full audit trail.
+		registerFleetMemoryTools(this.server, () => this.getFleetContext())
 	}
 
 	/**
@@ -792,5 +801,22 @@ export class SupermemoryMCP extends McpAgent<Env, unknown, Props> {
 			return baseDescription
 		}
 		return `${baseDescription}. Available projects: ${this.cachedContainerTags.join(", ")}`
+	}
+
+	/**
+	 * Build a GatewayContext from the current authenticated props.
+	 * In the fleet memory model, the userId maps to both the tenant and principal.
+	 * A production deployment would use a dedicated tenant registry.
+	 */
+	private getFleetContext(): GatewayContext {
+		if (!this.props) {
+			throw new Error("Authentication required")
+		}
+		return {
+			tenant_id: this.props.userId,
+			principal_id: this.props.userId,
+			agent_id: this.getMcpSessionId(),
+			session_id: this.getMcpSessionId(),
+		}
 	}
 }
